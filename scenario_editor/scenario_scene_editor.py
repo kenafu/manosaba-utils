@@ -4,6 +4,7 @@ import uuid
 import pandas as pd
 from datetime import datetime
 from enum import Enum
+import re
 
 try:
     from PySide6.QtWidgets import (QApplication, QMainWindow, QTableView, QVBoxLayout, 
@@ -43,8 +44,10 @@ COLS_SCENE = [
 COLS_CHOICE = [
     {'id': 'choice_id', 'label': 'ID', 'readonly': True, 'width': 80},
     {'id': 'choice_text_uid', 'label': 'Choice Text UID', 'readonly': False, 'width': 200},
+    {'id': 'choice_text', 'label': 'Choice Text', 'readonly': True, 'width': 240},
     {'id': 'axis', 'label': 'Axis', 'readonly': False, 'width': 100},
     {'id': 'next_scene_id', 'label': 'Next Scene', 'readonly': False, 'width': 120},
+    {'id': 'next_scene_text', 'label': 'Next Text', 'readonly': True, 'width': 240},
     {'id': 'correct', 'label': 'Correct', 'readonly': False, 'width': 60}, # Added correct column
     {'id': 'disp_order', 'label': 'Order', 'readonly': False, 'width': 60},
 ]
@@ -54,6 +57,7 @@ COLS_SPOT = [
     {'id': 'spot_id', 'label': 'ID', 'readonly': True, 'width': 80},
     {'id': 'target_text', 'label': 'Target Text', 'readonly': False, 'width': 200},
     {'id': 'next_scene_id', 'label': 'Next Scene', 'readonly': False, 'width': 120},
+    {'id': 'next_scene_text', 'label': 'Next Text', 'readonly': True, 'width': 260},
     {'id': 'correct', 'label': 'Correct', 'readonly': False, 'width': 60}, # 0 or 1
     {'id': 'disp_order', 'label': 'Order', 'readonly': False, 'width': 60},
 ]
@@ -123,6 +127,10 @@ class PandasTableModel(QAbstractTableModel):
         col_id = self.col_ids[col]
         
         if role == Qt.DisplayRole or role == Qt.EditRole:
+            val = self._view_df.iloc[row][col_id]
+            return str(val) if pd.notna(val) else ""
+
+        if role == Qt.ToolTipRole:
             val = self._view_df.iloc[row][col_id]
             return str(val) if pd.notna(val) else ""
             
@@ -415,6 +423,20 @@ class ScenarioEditor(QMainWindow):
         act_gen_choices = QAction("Generate Choices from Text", self)
         act_gen_choices.triggered.connect(self.generate_choices_from_text)
         tools_menu.addAction(act_gen_choices)
+
+        tools_menu.addSeparator()
+
+        act_gen_testimony = QAction("Generate Testimony Spots/Branches/Choices", self)
+        act_gen_testimony.triggered.connect(self.generate_testimony_spots_branches_choices)
+        tools_menu.addAction(act_gen_testimony)
+
+        act_resolve_next = QAction("Auto-Resolve Choice Next Scenes", self)
+        act_resolve_next.triggered.connect(self.auto_resolve_choice_next_scenes)
+        tools_menu.addAction(act_resolve_next)
+
+        act_resolve_next_pick = QAction("Pick Unresolved Choice Next Scenes...", self)
+        act_resolve_next_pick.triggered.connect(self.pick_unresolved_choice_next_scenes)
+        tools_menu.addAction(act_resolve_next_pick)
 
         # Splitter (Left: Scene List, Right: Detail Editors)
         splitter = QSplitter(Qt.Horizontal)
@@ -846,7 +868,7 @@ class ScenarioEditor(QMainWindow):
             # 現在表示中のシーンがあれば更新
             if self.current_scene_uid:
                 choices_subset = self.df_choices[self.df_choices['scene_id'] == self.current_scene_uid].copy()
-                self.choice_model.set_dataframe(choices_subset)
+                self.choice_model.set_dataframe(self._choices_with_texts(choices_subset))
             
             QMessageBox.information(self, "Success", f"{count} choices generated. {updates_scene_count} scenes updated.")
         elif updates_scene_count > 0:
@@ -861,6 +883,550 @@ class ScenarioEditor(QMainWindow):
             # 選択中の行のプロパティも更新する
             if self.current_scene_uid:
                  self.on_scene_selected(self.scene_table.currentIndex(), QModelIndex())
+
+    # -------------------------------------------------------------------------
+    # Tools: Testimony automation (click spot + branch + choice)
+    # -------------------------------------------------------------------------
+    def _extract_link_tags(self, text: str):
+        s = text or ""
+        links = []
+        for m in re.finditer(r'<link="([^"]+)">(.*?)</link>', s, flags=re.IGNORECASE | re.DOTALL):
+            link_id = (m.group(1) or "").strip()
+            label = (m.group(2) or "").strip()
+            if link_id and label:
+                links.append((link_id, label))
+        return links
+
+    def _parse_objection_id(self, link_id: str):
+        m = re.fullmatch(r"Objection_(\d{2})_(\d{2})_(\d{2})_(\d{2})", (link_id or "").strip())
+        if not m:
+            return None
+        a = int(m.group(1))
+        b = int(m.group(2))
+        c = int(m.group(3))
+        d = int(m.group(4))
+        return a, b, c, d
+
+    def _choice_uid_from_objection_id(self, link_id: str):
+        parsed = self._parse_objection_id(link_id)
+        if not parsed:
+            return None
+        a, b, c, d = parsed
+        return f"{a:02}{b:02}Trial{c:02}_Choice{d:03}"
+
+    def _trial_prefix_from_uid(self, uid: str):
+        m = re.match(r"^(\d{4}Trial\d{2})_", (uid or "").strip())
+        return m.group(1) if m else None
+
+    def _ensure_scene_row(self, uid: str, scene_type: str, text: str = "", actor: str = "", next_scene_uid: str = ""):
+        uid = (uid or "").strip()
+        if uid == "":
+            return False
+        existing = set(self.scene_model.df["uid"].astype(str)) if "uid" in self.scene_model.df.columns else set()
+        if uid in existing:
+            return False
+        new_row = {
+            "uid": uid,
+            "text": text or "",
+            "actor": actor or "",
+            "scene_type": scene_type or "linear",
+            "next_scene_uid": next_scene_uid or "",
+        }
+        self.scene_model.df = pd.concat([self.scene_model.df, pd.DataFrame([new_row])], ignore_index=True)
+        return True
+
+    def _ensure_choice_row(self, scene_id: str, choice_text_uid: str, disp_order: int, axis: str = "progression"):
+        scene_id = str(scene_id or "")
+        choice_text_uid = str(choice_text_uid or "")
+        if scene_id == "" or choice_text_uid == "":
+            return False
+
+        if self.df_choices is None or self.df_choices.empty:
+            cols = [c['id'] for c in COLS_CHOICE] + ["scene_id"]
+            self.df_choices = pd.DataFrame(columns=cols)
+
+        if "scene_id" not in self.df_choices.columns:
+            self.df_choices["scene_id"] = ""
+
+        existing_keys = set()
+        if not self.df_choices.empty and "choice_text_uid" in self.df_choices.columns:
+            for _, row in self.df_choices.iterrows():
+                existing_keys.add((str(row.get("scene_id", "")), str(row.get("choice_text_uid", ""))))
+
+        if (scene_id, choice_text_uid) in existing_keys:
+            return False
+
+        existing_ids = set(self.df_choices["choice_id"].astype(str)) if "choice_id" in self.df_choices.columns else set()
+        choice_id = str(uuid.uuid4())[:8]
+        while choice_id in existing_ids:
+            choice_id = str(uuid.uuid4())[:8]
+
+        new_row = {
+            "choice_id": choice_id,
+            "scene_id": scene_id,
+            "choice_text_uid": choice_text_uid,
+            "axis": axis,
+            "next_scene_id": "",
+            "correct": 0,
+            "disp_order": int(disp_order) if disp_order is not None else 0,
+        }
+        self.df_choices = pd.concat([self.df_choices, pd.DataFrame([new_row])], ignore_index=True)
+        return True
+
+    def _upsert_spot_row(self, scene_id: str, target_text: str, next_scene_id: str, disp_order: int, spot_id: str):
+        scene_id = str(scene_id or "")
+        target_text = str(target_text or "")
+        next_scene_id = str(next_scene_id or "")
+        spot_id = str(spot_id or "")
+        if scene_id == "" or target_text == "" or spot_id == "":
+            return False, False
+
+        if self.df_spots is None or self.df_spots.empty:
+            cols = [c['id'] for c in COLS_SPOT] + ["scene_id"]
+            self.df_spots = pd.DataFrame(columns=cols)
+
+        if "scene_id" not in self.df_spots.columns:
+            self.df_spots["scene_id"] = ""
+
+        if "spot_id" in self.df_spots.columns:
+            mask = self.df_spots["spot_id"].astype(str) == spot_id
+            if mask.any():
+                # 既存spot_idがあれば更新（testimony再生成時の修正用途）
+                idx = self.df_spots.index[mask][0]
+                self.df_spots.at[idx, "scene_id"] = scene_id
+                self.df_spots.at[idx, "target_text"] = target_text
+                self.df_spots.at[idx, "next_scene_id"] = next_scene_id
+                try:
+                    cur = self.df_spots.at[idx, "disp_order"]
+                    if cur is None or (isinstance(cur, str) and cur.strip() == ""):
+                        self.df_spots.at[idx, "disp_order"] = int(disp_order) if disp_order is not None else 0
+                except Exception:
+                    self.df_spots.at[idx, "disp_order"] = int(disp_order) if disp_order is not None else 0
+                return False, True
+
+        # spot_id が無い場合のみ新規追加（重複回避のため suffix は付けない）
+        new_row = {
+            "spot_id": spot_id,
+            "scene_id": scene_id,
+            "target_text": target_text,
+            "next_scene_id": next_scene_id,
+            "correct": 0,
+            "disp_order": int(disp_order) if disp_order is not None else 0,
+        }
+        self.df_spots = pd.concat([self.df_spots, pd.DataFrame([new_row])], ignore_index=True)
+        return True, False
+
+    def generate_testimony_spots_branches_choices(self):
+        msg = (
+            "testimony シーンの本文から <link=\"Objection_..\">..</link> を抽出し、以下を一括生成します。\n\n"
+            "1) scenario_click_spot: scene_id=testimony, target_text=リンク文字列, next_scene_id=自動作成branch\n"
+            "2) scenario_text: branch シーン（存在しない場合）\n"
+            "3) scenario_text: choice_text シーン（存在しない場合）\n"
+            "4) scenario_choice: branch -> choice_text の紐付け（存在しない場合）\n\n"
+            "注意: next_scene_id(Choice) の自動設定は精度が落ちるため、別ツールで推定します。"
+        )
+        reply = QMessageBox.question(self, "Confirm", msg, QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        if self.scene_model.df is None or self.scene_model.df.empty:
+            QMessageBox.information(self, "No Data", "No scene data loaded.")
+            return
+
+        created_spots = 0
+        updated_spots = 0
+        created_branches = 0
+        created_choices_scene = 0
+        created_choice_links = 0
+        skipped_invalid = 0
+
+        df = self.scene_model.df
+
+        # disp_order の採番を scene_id 単位で継続する
+        next_spot_order = {}
+        if self.df_spots is not None and not self.df_spots.empty and "scene_id" in self.df_spots.columns:
+            for sid, sub in self.df_spots.groupby("scene_id"):
+                try:
+                    mx = int(pd.to_numeric(sub.get("disp_order", pd.Series([0])), errors="coerce").fillna(0).max())
+                except Exception:
+                    mx = 0
+                next_spot_order[str(sid)] = mx + 1
+
+        for _, row in df.iterrows():
+            uid = str(row.get("uid", ""))
+            st = str(row.get("scene_type", ""))
+            if st != "testimony":
+                continue
+
+            links = self._extract_link_tags(str(row.get("text", "")))
+            if not links:
+                continue
+
+            for link_id, label in links:
+                choice_uid = self._choice_uid_from_objection_id(link_id)
+                parsed = self._parse_objection_id(link_id)
+                if not choice_uid or not parsed:
+                    skipped_invalid += 1
+                    continue
+
+                _, _, _, d = parsed
+                branch_uid = f"{uid}_Branch{d:03}"
+
+                if self._ensure_scene_row(branch_uid, "branch", text=f"[AUTO] {link_id}"):
+                    created_branches += 1
+
+                # choice_text シーンが無ければ作る（本文は空のまま）
+                if self._ensure_scene_row(choice_uid, "choice_text", text=""):
+                    created_choices_scene += 1
+
+                # choice link: branch -> choice_text
+                if self._ensure_choice_row(branch_uid, choice_uid, disp_order=d):
+                    created_choice_links += 1
+
+                # click spot: testimony -> branch
+                order = next_spot_order.get(uid, 1)
+                spot_id = f"{uid}__{link_id}"
+                created, updated = self._upsert_spot_row(uid, label, branch_uid, disp_order=order, spot_id=spot_id)
+                if created:
+                    created_spots += 1
+                    next_spot_order[uid] = order + 1
+                elif updated:
+                    updated_spots += 1
+
+        # UI反映
+        self.scene_model.set_dataframe(self.scene_model.df)
+        if self.current_scene_uid:
+            self.on_scene_selected(self.scene_table.currentIndex(), QModelIndex())
+
+        QMessageBox.information(
+            self,
+            "Done",
+            f"Created spots: {created_spots}\n"
+            f"Updated spots: {updated_spots}\n"
+            f"Created branch scenes: {created_branches}\n"
+            f"Created choice_text scenes: {created_choices_scene}\n"
+            f"Created scenario_choice links: {created_choice_links}\n"
+            f"Skipped (invalid link_id): {skipped_invalid}",
+        )
+
+    def _normalize_text_for_match(self, s: str):
+        s = s or ""
+        # ruby/link 等のタグは雑に除去（完全なHTMLパーサは不要）
+        s = re.sub(r"<[^>]+>", "", s)
+        s = s.replace("\u3000", " ")
+        s = s.replace("\n", " ")
+        s = s.replace("\r", " ")
+        return s
+
+    def _text_preview(self, s: str, limit: int = 80):
+        s = self._normalize_text_for_match(s)
+        s = re.sub(r"\s+", " ", s).strip()
+        if limit and len(s) > limit:
+            return s[:limit] + "..."
+        return s
+
+    def _choices_with_texts(self, df_choices: pd.DataFrame):
+        df = df_choices.copy() if df_choices is not None else pd.DataFrame(columns=[c["id"] for c in COLS_CHOICE] + ["scene_id"])
+        if df.empty:
+            for c in ("choice_text", "next_scene_text"):
+                if c not in df.columns:
+                    df[c] = ""
+            return df
+
+        scene_text_map = {}
+        if self.scene_model.df is not None and not self.scene_model.df.empty and "uid" in self.scene_model.df.columns:
+            try:
+                scene_text_map = dict(zip(self.scene_model.df["uid"].astype(str), self.scene_model.df.get("text", "").astype(str)))
+            except Exception:
+                scene_text_map = {}
+
+        def map_choice_text(uid):
+            return self._text_preview(scene_text_map.get(str(uid or ""), ""))
+
+        def map_next_text(uid):
+            return self._text_preview(scene_text_map.get(str(uid or ""), ""))
+
+        df["choice_text"] = df.get("choice_text_uid", "").apply(map_choice_text)
+        df["next_scene_text"] = df.get("next_scene_id", "").apply(map_next_text)
+        return df
+
+    def _spots_with_texts(self, df_spots: pd.DataFrame):
+        df = df_spots.copy() if df_spots is not None else pd.DataFrame(columns=[c["id"] for c in COLS_SPOT] + ["scene_id"])
+        if df.empty:
+            if "next_scene_text" not in df.columns:
+                df["next_scene_text"] = ""
+            return df
+
+        scene_text_map = {}
+        if self.scene_model.df is not None and not self.scene_model.df.empty and "uid" in self.scene_model.df.columns:
+            try:
+                scene_text_map = dict(zip(self.scene_model.df["uid"].astype(str), self.scene_model.df.get("text", "").astype(str)))
+            except Exception:
+                scene_text_map = {}
+
+        def map_next_text(uid):
+            return self._text_preview(scene_text_map.get(str(uid or ""), ""))
+
+        df["next_scene_text"] = df.get("next_scene_id", "").apply(map_next_text)
+        return df
+
+    def _keywords_from_text(self, s: str):
+        s = self._normalize_text_for_match(s)
+        # 日本語は分かち書きが難しいので、漢字/カタカナ/英数の連続をキーワードにする
+        toks = re.findall(r"[A-Za-z0-9_]+|[ァ-ヶー]{2,}|[一-龠]{1,}", s)
+        # 1文字漢字はノイズも多いので、数を絞る（ただし「血」「筆」みたいな重要語もある）
+        keep = []
+        for t in toks:
+            t = t.strip()
+            if t == "":
+                continue
+            if len(t) == 1 and t not in ("血", "筆", "矢", "鍵"):
+                continue
+            keep.append(t)
+        # 重複除去（順序維持）
+        seen = set()
+        out = []
+        for t in keep:
+            if t in seen:
+                continue
+            seen.add(t)
+            out.append(t)
+        return out[:12]
+
+    def auto_resolve_choice_next_scenes(self):
+        reply = QMessageBox.question(
+            self,
+            "Confirm",
+            "scenario_choice.next_scene_id が空の行について、テキストの簡易一致で遷移先UIDを推定して自動設定しますか？\n"
+            "（候補が見つからない/曖昧な場合は未設定のままです）",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        if self.df_choices is None or self.df_choices.empty:
+            QMessageBox.information(self, "No Choices", "No scenario_choice data loaded.")
+            return
+
+        df_scenes = self.scene_model.df
+        if df_scenes is None or df_scenes.empty:
+            QMessageBox.information(self, "No Scenes", "No scene data loaded.")
+            return
+
+        # uid -> (index, text, scene_type)
+        scene_index = {}
+        for i, r in df_scenes.iterrows():
+            uid = str(r.get("uid", ""))
+            if uid:
+                scene_index[uid] = (i, str(r.get("text", "")), str(r.get("scene_type", "")))
+
+        # prefix -> indices
+        prefix_to_indices = {}
+        for uid, (i, _, _) in scene_index.items():
+            prefix = self._trial_prefix_from_uid(uid)
+            if not prefix:
+                continue
+            prefix_to_indices.setdefault(prefix, []).append(i)
+        for p in prefix_to_indices:
+            prefix_to_indices[p] = sorted(prefix_to_indices[p])
+
+        updated = 0
+        unresolved = 0
+
+        for idx, row in self.df_choices.iterrows():
+            cur_next = str(row.get("next_scene_id", "") or "")
+            if cur_next.strip() != "":
+                continue
+
+            choice_uid = str(row.get("choice_text_uid", "") or "")
+            if choice_uid not in scene_index:
+                unresolved += 1
+                continue
+
+            choice_i, choice_text, _ = scene_index[choice_uid]
+            prefix = self._trial_prefix_from_uid(choice_uid)
+            if not prefix or prefix not in prefix_to_indices:
+                unresolved += 1
+                continue
+
+            # choice_text の連続ブロックの末尾を探す
+            indices = prefix_to_indices[prefix]
+            try:
+                pos = indices.index(choice_i)
+            except ValueError:
+                unresolved += 1
+                continue
+
+            block_end = choice_i
+            for j in indices[pos + 1:]:
+                uid2 = str(df_scenes.at[j, "uid"])
+                if str(df_scenes.at[j, "scene_type"]) != "choice_text":
+                    break
+                block_end = j
+
+            # マッチ用キーワード
+            kw = self._keywords_from_text(choice_text)
+            if not kw:
+                unresolved += 1
+                continue
+
+            best_uid = None
+            best_score = -1
+            best_idx = None
+
+            # ブロック末尾以降で探す（同一prefix内）
+            for j in indices:
+                if j <= block_end:
+                    continue
+                uid2 = str(df_scenes.at[j, "uid"])
+                st2 = str(df_scenes.at[j, "scene_type"])
+                if st2 == "choice_text":
+                    continue
+                t2 = self._normalize_text_for_match(str(df_scenes.at[j, "text"]))
+                if t2.strip() == "":
+                    continue
+
+                score = 0
+                for k in kw:
+                    if k in t2:
+                        # 長い語ほど重くする
+                        score += 3 if len(k) >= 3 else 1
+                if score <= 0:
+                    continue
+
+                # 早い出現を軽く優先
+                score2 = score * 1000 - int(j)
+                if score2 > best_score:
+                    best_score = score2
+                    best_uid = uid2
+                    best_idx = j
+
+            if best_uid:
+                self.df_choices.at[idx, "next_scene_id"] = best_uid
+                updated += 1
+            else:
+                unresolved += 1
+
+        if self.current_scene_uid:
+            subset = self.df_choices[self.df_choices["scene_id"] == self.current_scene_uid].copy()
+            self.choice_model.set_dataframe(self._choices_with_texts(subset))
+
+        QMessageBox.information(self, "Done", f"Updated: {updated}\nUnresolved: {unresolved}")
+
+    # -------------------------------------------------------------------------
+    # Tools: Interactive Next Scene picker (choice)
+    # -------------------------------------------------------------------------
+    def pick_unresolved_choice_next_scenes(self):
+        reply = QMessageBox.question(
+            self,
+            "Confirm",
+            "next_scene_id が未設定の scenario_choice について、候補UIDを絞り込んだ一覧から順に選択しますか？\n"
+            "（キャンセルで途中終了）",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        if self.df_choices is None or self.df_choices.empty:
+            QMessageBox.information(self, "No Choices", "No scenario_choice data loaded.")
+            return
+
+        df_scenes = self.scene_model.df
+        if df_scenes is None or df_scenes.empty:
+            QMessageBox.information(self, "No Scenes", "No scene data loaded.")
+            return
+
+        uid_to_idx = {}
+        uid_to_text = {}
+        for i, r in df_scenes.iterrows():
+            uid = str(r.get("uid", ""))
+            if uid:
+                uid_to_idx[uid] = i
+                uid_to_text[uid] = str(r.get("text", ""))
+
+        prefix_to_indices = {}
+        for uid, i in uid_to_idx.items():
+            prefix = self._trial_prefix_from_uid(uid)
+            if not prefix:
+                continue
+            prefix_to_indices.setdefault(prefix, []).append(i)
+        for p in prefix_to_indices:
+            prefix_to_indices[p] = sorted(prefix_to_indices[p])
+
+        self.save_current_sub_tables()
+
+        updated = 0
+        skipped = 0
+        total_unresolved = 0
+
+        for df_idx, row in self.df_choices.iterrows():
+            cur_next = str(row.get("next_scene_id", "") or "").strip()
+            if cur_next != "":
+                continue
+
+            total_unresolved += 1
+
+            choice_uid = str(row.get("choice_text_uid", "") or "")
+            if choice_uid == "" or choice_uid not in uid_to_idx:
+                skipped += 1
+                continue
+
+            prefix = self._trial_prefix_from_uid(choice_uid)
+            if not prefix or prefix not in prefix_to_indices:
+                skipped += 1
+                continue
+
+            choice_i = uid_to_idx[choice_uid]
+            indices = prefix_to_indices[prefix]
+
+            try:
+                pos = indices.index(choice_i)
+            except ValueError:
+                skipped += 1
+                continue
+
+            block_end = choice_i
+            for j in indices[pos + 1:]:
+                if str(df_scenes.at[j, "scene_type"]) != "choice_text":
+                    break
+                block_end = j
+
+            candidates = []
+            for j in indices:
+                if j <= block_end:
+                    continue
+                uid2 = str(df_scenes.at[j, "uid"])
+                st2 = str(df_scenes.at[j, "scene_type"])
+                if st2 == "choice_text":
+                    continue
+                candidates.append(uid2)
+
+            if not candidates:
+                skipped += 1
+                continue
+
+            choice_text = self._normalize_text_for_match(uid_to_text.get(choice_uid, ""))
+            prompt = (
+                f"choice_text_uid: {choice_uid}\n"
+                f"text: {choice_text[:120]}\n\n"
+                "Select Next UID:"
+            )
+            picked = self._pick_scene_uid_from_candidates("Pick Next Scene (Choice)", prompt, candidates)
+            if picked is None:
+                break
+
+            self.df_choices.at[df_idx, "next_scene_id"] = picked
+            updated += 1
+
+        if self.current_scene_uid:
+            subset = self.df_choices[self.df_choices["scene_id"] == self.current_scene_uid].copy()
+            self.choice_model.set_dataframe(self._choices_with_texts(subset))
+
+        QMessageBox.information(
+            self,
+            "Done",
+            f"Updated: {updated}\nSkipped: {skipped}\nUnresolved (initial): {total_unresolved}",
+        )
 
     # -------------------------------------------------------------------------
     # DB & Data Handling (New/Import/Open/Save)
@@ -1132,24 +1698,24 @@ class ScenarioEditor(QMainWindow):
         self.edit_text.setPlainText(str(scene_row['text']))
         
         choices_subset = self.df_choices[self.df_choices['scene_id'] == self.current_scene_uid].copy()
-        self.choice_model.set_dataframe(choices_subset)
+        self.choice_model.set_dataframe(self._choices_with_texts(choices_subset))
         
         spots_subset = self.df_spots[self.df_spots['scene_id'] == self.current_scene_uid].copy()
-        self.spot_model.set_dataframe(spots_subset)
+        self.spot_model.set_dataframe(self._spots_with_texts(spots_subset))
         
         self.updating_ui = False
 
     def save_current_sub_tables(self):
         if not self.current_scene_uid: return
         
-        current_choices = self.choice_model.get_dataframe()
-        other_choices = self.df_choices[self.df_choices['scene_id'] != self.current_scene_uid]
+        current_choices = self.choice_model.get_dataframe().drop(columns=["choice_text", "next_scene_text"], errors="ignore")
+        other_choices = self.df_choices[self.df_choices['scene_id'] != self.current_scene_uid].drop(columns=["choice_text", "next_scene_text"], errors="ignore")
         if not current_choices.empty:
             current_choices['scene_id'] = self.current_scene_uid
         self.df_choices = pd.concat([other_choices, current_choices], ignore_index=True)
         
-        current_spots = self.spot_model.get_dataframe()
-        other_spots = self.df_spots[self.df_spots['scene_id'] != self.current_scene_uid]
+        current_spots = self.spot_model.get_dataframe().drop(columns=["next_scene_text"], errors="ignore")
+        other_spots = self.df_spots[self.df_spots['scene_id'] != self.current_scene_uid].drop(columns=["next_scene_text"], errors="ignore")
         if not current_spots.empty:
             current_spots['scene_id'] = self.current_scene_uid
         self.df_spots = pd.concat([other_spots, current_spots], ignore_index=True)
@@ -1356,7 +1922,7 @@ class ScenarioEditor(QMainWindow):
 
         if self.current_scene_uid:
             subset = self.df_choices[self.df_choices["scene_id"] == self.current_scene_uid].copy()
-            self.choice_model.set_dataframe(subset)
+            self.choice_model.set_dataframe(self._choices_with_texts(subset))
 
         QMessageBox.information(self, "Renamed", f"Renamed choice_id:\n{old_id} -> {new_id}")
 
@@ -1386,7 +1952,7 @@ class ScenarioEditor(QMainWindow):
 
         if self.current_scene_uid:
             subset = self.df_spots[self.df_spots["scene_id"] == self.current_scene_uid].copy()
-            self.spot_model.set_dataframe(subset)
+            self.spot_model.set_dataframe(self._spots_with_texts(subset))
 
         QMessageBox.information(self, "Renamed", f"Renamed spot_id:\n{old_id} -> {new_id}")
 
@@ -1399,6 +1965,16 @@ class ScenarioEditor(QMainWindow):
             QMessageBox.warning(self, "No Scenes", "No scene UIDs available.")
             return None
         picked, ok = QInputDialog.getItem(self, title, "Select UID:", uids, 0, False)
+        if not ok:
+            return None
+        return picked
+
+    def _pick_scene_uid_from_candidates(self, title: str, prompt: str, candidates):
+        uids = [str(u) for u in (candidates or []) if str(u).strip() != ""]
+        if not uids:
+            QMessageBox.warning(self, "No Candidates", "No candidate UIDs available.")
+            return None
+        picked, ok = QInputDialog.getItem(self, title, prompt, uids, 0, False)
         if not ok:
             return None
         return picked
@@ -1417,7 +1993,7 @@ class ScenarioEditor(QMainWindow):
         self.save_current_sub_tables()
         self.df_choices.loc[self.df_choices["choice_id"] == choice_id, "next_scene_id"] = picked
         subset = self.df_choices[self.df_choices["scene_id"] == self.current_scene_uid].copy()
-        self.choice_model.set_dataframe(subset)
+        self.choice_model.set_dataframe(self._choices_with_texts(subset))
 
     def prompt_set_next_scene_for_spot(self, idx: QModelIndex):
         if not idx.isValid():
@@ -1433,7 +2009,7 @@ class ScenarioEditor(QMainWindow):
         self.save_current_sub_tables()
         self.df_spots.loc[self.df_spots["spot_id"] == spot_id, "next_scene_id"] = picked
         subset = self.df_spots[self.df_spots["scene_id"] == self.current_scene_uid].copy()
-        self.spot_model.set_dataframe(subset)
+        self.spot_model.set_dataframe(self._spots_with_texts(subset))
 
     # -------------------------------------------------------------------------
     # Spot from selection + highlight preview
@@ -1471,7 +2047,7 @@ class ScenarioEditor(QMainWindow):
         self.df_spots = pd.concat([self.df_spots, pd.DataFrame([new_row])], ignore_index=True)
 
         subset = self.df_spots[self.df_spots["scene_id"] == self.current_scene_uid].copy()
-        self.spot_model.set_dataframe(subset)
+        self.spot_model.set_dataframe(self._spots_with_texts(subset))
 
         for r in range(self.spot_model.rowCount()):
             if str(self.spot_model._view_df.iloc[r]["spot_id"]) == spot_id:
