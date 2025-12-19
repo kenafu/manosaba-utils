@@ -12,7 +12,8 @@ try:
                                    QMessageBox, QAbstractItemView, QMenu, QSplitter,
                                    QLineEdit, QLabel, QFormLayout, QComboBox, QPlainTextEdit,
                                    QPushButton, QGroupBox, QSpacerItem, QSizePolicy, QDialog,
-                                   QInputDialog, QTextEdit, QDialogButtonBox, QVBoxLayout)
+                                   QInputDialog, QTextEdit, QDialogButtonBox, QVBoxLayout,
+                                   QListWidget)
     from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, Signal, Slot, QTimer, QSize, QEvent, QRect
     from PySide6.QtGui import QAction, QColor, QKeySequence, QIcon, QFont, QTextCursor, QTextCharFormat
 except ImportError:
@@ -303,6 +304,167 @@ class FilterHeaderView(QHeaderView):
             editor.raise_()
 
 # -----------------------------------------------------------------------------
+# Non-modal picker dialog (allows main window interaction)
+# -----------------------------------------------------------------------------
+class NextScenePickerDialog(QDialog):
+    def __init__(self, editor, kind: str, tasks: list):
+        super().__init__(editor)
+        self.editor = editor
+        self.kind = kind  # "choice" or "spot"
+        self.tasks = tasks or []
+        self.task_pos = 0
+        self._filtered_candidates = []
+
+        self.setWindowTitle(f"Next Scene Picker ({kind})")
+        self.setWindowModality(Qt.NonModal)
+        self.setMinimumSize(720, 520)
+
+        layout = QVBoxLayout(self)
+
+        self.lbl_context = QLabel("")
+        self.lbl_context.setWordWrap(True)
+        layout.addWidget(self.lbl_context)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Filter:"))
+        self.edit_filter = QLineEdit()
+        self.edit_filter.setPlaceholderText("Type to filter candidates (UID or text preview)...")
+        self.edit_filter.textChanged.connect(self._apply_filter)
+        row.addWidget(self.edit_filter, 1)
+        layout.addLayout(row)
+
+        self.list_candidates = QListWidget()
+        self.list_candidates.currentRowChanged.connect(self._on_candidate_changed)
+        self.list_candidates.itemDoubleClicked.connect(lambda _: self._apply_selected())
+        layout.addWidget(self.list_candidates, 1)
+
+        btns = QHBoxLayout()
+        self.btn_apply = QPushButton("Set (Selected)")
+        self.btn_apply.clicked.connect(self._apply_selected)
+        btns.addWidget(self.btn_apply)
+
+        self.btn_use_main = QPushButton("Set (Use Main Selection)")
+        self.btn_use_main.clicked.connect(self._apply_main_selection)
+        btns.addWidget(self.btn_use_main)
+
+        self.btn_skip = QPushButton("Skip")
+        self.btn_skip.clicked.connect(self._skip)
+        btns.addWidget(self.btn_skip)
+
+        btns.addStretch(1)
+
+        self.btn_stop = QPushButton("Close")
+        self.btn_stop.clicked.connect(self.close)
+        btns.addWidget(self.btn_stop)
+        layout.addLayout(btns)
+
+        self._load_task(0)
+
+    def closeEvent(self, event):
+        try:
+            if getattr(self.editor, "_next_scene_picker_dialog", None) is self:
+                self.editor._next_scene_picker_dialog = None
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+    def _current_task(self):
+        if 0 <= self.task_pos < len(self.tasks):
+            return self.tasks[self.task_pos]
+        return None
+
+    def _set_context_text(self):
+        t = self._current_task()
+        if not t:
+            self.lbl_context.setText("No unresolved items.")
+            return
+        self.lbl_context.setText(t.get("context", ""))
+
+    def _apply_filter(self):
+        t = self._current_task()
+        if not t:
+            return
+        query = (self.edit_filter.text() or "").strip().lower()
+        candidates = t.get("candidates", [])
+        pretty = t.get("candidates_pretty", [])
+
+        self.list_candidates.clear()
+        self._filtered_candidates = []
+
+        if not candidates:
+            return
+
+        if query == "":
+            self._filtered_candidates = list(candidates)
+            for s in pretty:
+                self.list_candidates.addItem(s)
+        else:
+            for uid, label in zip(candidates, pretty):
+                if query in str(uid).lower() or query in str(label).lower():
+                    self._filtered_candidates.append(uid)
+                    self.list_candidates.addItem(label)
+
+        if self.list_candidates.count() > 0:
+            self.list_candidates.setCurrentRow(0)
+
+    def _load_task(self, pos: int):
+        self.task_pos = pos
+        if self.task_pos >= len(self.tasks):
+            self.lbl_context.setText("Done.")
+            self.list_candidates.clear()
+            self.edit_filter.setEnabled(False)
+            self.btn_apply.setEnabled(False)
+            self.btn_use_main.setEnabled(False)
+            self.btn_skip.setEnabled(False)
+            return
+
+        self.edit_filter.setEnabled(True)
+        self.btn_apply.setEnabled(True)
+        self.btn_use_main.setEnabled(True)
+        self.btn_skip.setEnabled(True)
+
+        self.edit_filter.blockSignals(True)
+        self.edit_filter.setText("")
+        self.edit_filter.blockSignals(False)
+
+        self._set_context_text()
+        self._apply_filter()
+
+    def _on_candidate_changed(self, row: int):
+        if row < 0 or row >= len(self._filtered_candidates):
+            return
+        uid = self._filtered_candidates[row]
+        self.editor._select_scene_by_uid(uid)
+
+    def _apply_selected(self):
+        row = self.list_candidates.currentRow()
+        if row < 0 or row >= len(self._filtered_candidates):
+            return
+        uid = self._filtered_candidates[row]
+        self._apply_uid(uid)
+
+    def _apply_main_selection(self):
+        uid = self.editor._get_current_selected_scene_uid()
+        if not uid:
+            QMessageBox.information(self, "No Selection", "Select a scene row in the main scene table first.")
+            return
+        self._apply_uid(uid)
+
+    def _apply_uid(self, uid: str):
+        t = self._current_task()
+        if not t:
+            return
+        try:
+            self.editor._apply_next_scene_to_task(self.kind, t, uid)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+            return
+        self._load_task(self.task_pos + 1)
+
+    def _skip(self):
+        self._load_task(self.task_pos + 1)
+
+# -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 # メインウィンドウ
 # -----------------------------------------------------------------------------
@@ -314,6 +476,7 @@ class ScenarioEditor(QMainWindow):
         
         self.current_db_path = None
         self.current_scene_uid = None
+        self._next_scene_picker_dialog = None
 
         # DataFrames (Master)
         self.df_scenes = pd.DataFrame()
@@ -437,6 +600,10 @@ class ScenarioEditor(QMainWindow):
         act_resolve_next_pick = QAction("Pick Unresolved Choice Next Scenes...", self)
         act_resolve_next_pick.triggered.connect(self.pick_unresolved_choice_next_scenes)
         tools_menu.addAction(act_resolve_next_pick)
+
+        act_resolve_next_spot_pick = QAction("Pick Unresolved Spot Next Scenes...", self)
+        act_resolve_next_spot_pick.triggered.connect(self.pick_unresolved_spot_next_scenes)
+        tools_menu.addAction(act_resolve_next_spot_pick)
 
         # Splitter (Left: Scene List, Right: Detail Editors)
         splitter = QSplitter(Qt.Horizontal)
@@ -918,6 +1085,81 @@ class ScenarioEditor(QMainWindow):
         m = re.match(r"^(\d{4}Trial\d{2})_", (uid or "").strip())
         return m.group(1) if m else None
 
+    def _get_current_selected_scene_uid(self):
+        try:
+            idx = self.scene_table.currentIndex()
+            if not idx.isValid():
+                return None
+            row = idx.row()
+            return str(self.scene_model._view_df.iloc[row].get("uid", ""))
+        except Exception:
+            return None
+
+    def _select_scene_by_uid(self, uid: str):
+        try:
+            uid = str(uid or "")
+            if uid == "":
+                return
+            view_match = self.scene_model._view_df[self.scene_model._view_df["uid"].astype(str) == uid]
+            if view_match.empty:
+                return
+            idx_label = view_match.index[0]
+            view_row = int(self.scene_model._view_df.index.get_loc(idx_label))
+            mi = self.scene_model.index(view_row, 0)
+            self.scene_table.setCurrentIndex(mi)
+            self.scene_table.selectRow(view_row)
+            self.scene_table.scrollTo(mi, QAbstractItemView.PositionAtCenter)
+            self.on_scene_selected(mi, QModelIndex())
+        except Exception:
+            return
+
+    def _scene_text_map(self):
+        if self.scene_model.df is None or self.scene_model.df.empty or "uid" not in self.scene_model.df.columns:
+            return {}
+        try:
+            return dict(zip(self.scene_model.df["uid"].astype(str), self.scene_model.df.get("text", "").astype(str)))
+        except Exception:
+            return {}
+
+    def _apply_next_scene_to_task(self, kind: str, task: dict, next_uid: str):
+        next_uid = str(next_uid or "").strip()
+        if next_uid == "":
+            return
+
+        if kind == "choice":
+            choice_id = str(task.get("choice_id", "") or "").strip()
+            if choice_id == "" or self.df_choices is None or self.df_choices.empty:
+                return
+            mask = self.df_choices.get("choice_id", pd.Series([], dtype=str)).astype(str) == choice_id
+            if not mask.any():
+                return
+            idx = self.df_choices.index[mask][0]
+            self.df_choices.at[idx, "next_scene_id"] = next_uid
+
+            scene_id = str(self.df_choices.at[idx, "scene_id"] if "scene_id" in self.df_choices.columns else "")
+            if self.current_scene_uid and scene_id == self.current_scene_uid:
+                subset = self.df_choices[self.df_choices["scene_id"] == self.current_scene_uid].copy()
+                self.choice_model.set_dataframe(self._choices_with_texts(subset))
+            return
+
+        if kind == "spot":
+            spot_id = str(task.get("spot_id", "") or "").strip()
+            if spot_id == "" or self.df_spots is None or self.df_spots.empty:
+                return
+            mask = self.df_spots.get("spot_id", pd.Series([], dtype=str)).astype(str) == spot_id
+            if not mask.any():
+                return
+            idx = self.df_spots.index[mask][0]
+            self.df_spots.at[idx, "next_scene_id"] = next_uid
+
+            scene_id = str(self.df_spots.at[idx, "scene_id"] if "scene_id" in self.df_spots.columns else "")
+            if self.current_scene_uid and scene_id == self.current_scene_uid:
+                subset = self.df_spots[self.df_spots["scene_id"] == self.current_scene_uid].copy()
+                self.spot_model.set_dataframe(self._spots_with_texts(subset))
+            return
+
+        raise ValueError(f"Unknown kind: {kind}")
+
     def _ensure_scene_row(self, uid: str, scene_type: str, text: str = "", actor: str = "", next_scene_uid: str = ""):
         uid = (uid or "").strip()
         if uid == "":
@@ -1320,11 +1562,17 @@ class ScenarioEditor(QMainWindow):
         reply = QMessageBox.question(
             self,
             "Confirm",
-            "next_scene_id が未設定の scenario_choice について、候補UIDを絞り込んだ一覧から順に選択しますか？\n"
-            "（キャンセルで途中終了）",
+            "next_scene_id が未設定の scenario_choice を順に処理するピッカーを開きます。\n"
+            "ピッカーは非モーダルなので、メインウィンドウ側で検索/フィルタして選択したUIDを\n"
+            "「Set (Use Main Selection)」で採用できます。",
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
+            return
+
+        if self._next_scene_picker_dialog is not None:
+            self._next_scene_picker_dialog.raise_()
+            self._next_scene_picker_dialog.activateWindow()
             return
 
         if self.df_choices is None or self.df_choices.empty:
@@ -1336,13 +1584,15 @@ class ScenarioEditor(QMainWindow):
             QMessageBox.information(self, "No Scenes", "No scene data loaded.")
             return
 
+        self.save_current_sub_tables()
+
+        scene_text_map = self._scene_text_map()
+
         uid_to_idx = {}
-        uid_to_text = {}
         for i, r in df_scenes.iterrows():
             uid = str(r.get("uid", ""))
             if uid:
                 uid_to_idx[uid] = i
-                uid_to_text[uid] = str(r.get("text", ""))
 
         prefix_to_indices = {}
         for uid, i in uid_to_idx.items():
@@ -1353,27 +1603,18 @@ class ScenarioEditor(QMainWindow):
         for p in prefix_to_indices:
             prefix_to_indices[p] = sorted(prefix_to_indices[p])
 
-        self.save_current_sub_tables()
-
-        updated = 0
-        skipped = 0
-        total_unresolved = 0
-
+        tasks = []
         for df_idx, row in self.df_choices.iterrows():
             cur_next = str(row.get("next_scene_id", "") or "").strip()
             if cur_next != "":
                 continue
 
-            total_unresolved += 1
-
             choice_uid = str(row.get("choice_text_uid", "") or "")
             if choice_uid == "" or choice_uid not in uid_to_idx:
-                skipped += 1
                 continue
 
             prefix = self._trial_prefix_from_uid(choice_uid)
             if not prefix or prefix not in prefix_to_indices:
-                skipped += 1
                 continue
 
             choice_i = uid_to_idx[choice_uid]
@@ -1382,7 +1623,6 @@ class ScenarioEditor(QMainWindow):
             try:
                 pos = indices.index(choice_i)
             except ValueError:
-                skipped += 1
                 continue
 
             block_end = choice_i
@@ -1402,31 +1642,143 @@ class ScenarioEditor(QMainWindow):
                 candidates.append(uid2)
 
             if not candidates:
-                skipped += 1
                 continue
 
-            choice_text = self._normalize_text_for_match(uid_to_text.get(choice_uid, ""))
-            prompt = (
+            candidates_pretty = [f"{u} | {self._text_preview(scene_text_map.get(u, ''), 90)}" for u in candidates]
+            scene_id = str(row.get("scene_id", "") or "")
+            choice_preview = self._text_preview(scene_text_map.get(choice_uid, ""), 120)
+            context = (
+                f"[Choice] {len(tasks) + 1}\n"
+                f"scene_id: {scene_id}\n"
                 f"choice_text_uid: {choice_uid}\n"
-                f"text: {choice_text[:120]}\n\n"
-                "Select Next UID:"
+                f"choice_text: {choice_preview}\n\n"
+                "Tips:\n"
+                "- 候補をクリックするとメイン左リストもジャンプします\n"
+                "- メイン側で検索/フィルタして選択したUIDは「Set (Use Main Selection)」で設定できます"
             )
-            picked = self._pick_scene_uid_from_candidates("Pick Next Scene (Choice)", prompt, candidates)
-            if picked is None:
-                break
+            tasks.append(
+                {
+                    "choice_id": str(row.get("choice_id", "") or ""),
+                    "candidates": candidates,
+                    "candidates_pretty": candidates_pretty,
+                    "context": context,
+                }
+            )
 
-            self.df_choices.at[df_idx, "next_scene_id"] = picked
-            updated += 1
+        if not tasks:
+            QMessageBox.information(self, "Done", "No unresolved scenario_choice.next_scene_id found.")
+            return
 
-        if self.current_scene_uid:
-            subset = self.df_choices[self.df_choices["scene_id"] == self.current_scene_uid].copy()
-            self.choice_model.set_dataframe(self._choices_with_texts(subset))
+        self._next_scene_picker_dialog = NextScenePickerDialog(self, "choice", tasks)
+        self._next_scene_picker_dialog.show()
+        self._next_scene_picker_dialog.raise_()
+        self._next_scene_picker_dialog.activateWindow()
 
-        QMessageBox.information(
+    def pick_unresolved_spot_next_scenes(self):
+        reply = QMessageBox.question(
             self,
-            "Done",
-            f"Updated: {updated}\nSkipped: {skipped}\nUnresolved (initial): {total_unresolved}",
+            "Confirm",
+            "next_scene_id が未設定の scenario_click_spot を順に処理するピッカーを開きます。\n"
+            "ピッカーは非モーダルなので、メインウィンドウ側で検索/フィルタして選択したUIDを\n"
+            "「Set (Use Main Selection)」で採用できます。",
+            QMessageBox.Yes | QMessageBox.No,
         )
+        if reply != QMessageBox.Yes:
+            return
+
+        if self._next_scene_picker_dialog is not None:
+            self._next_scene_picker_dialog.raise_()
+            self._next_scene_picker_dialog.activateWindow()
+            return
+
+        if self.df_spots is None or self.df_spots.empty:
+            QMessageBox.information(self, "No Spots", "No scenario_click_spot data loaded.")
+            return
+
+        df_scenes = self.scene_model.df
+        if df_scenes is None or df_scenes.empty:
+            QMessageBox.information(self, "No Scenes", "No scene data loaded.")
+            return
+
+        self.save_current_sub_tables()
+
+        scene_text_map = self._scene_text_map()
+
+        uid_to_idx = {}
+        for i, r in df_scenes.iterrows():
+            uid = str(r.get("uid", ""))
+            if uid:
+                uid_to_idx[uid] = i
+
+        prefix_to_indices = {}
+        for uid, i in uid_to_idx.items():
+            prefix = self._trial_prefix_from_uid(uid)
+            if not prefix:
+                continue
+            prefix_to_indices.setdefault(prefix, []).append(i)
+        for p in prefix_to_indices:
+            prefix_to_indices[p] = sorted(prefix_to_indices[p])
+
+        tasks = []
+        for df_idx, row in self.df_spots.iterrows():
+            cur_next = str(row.get("next_scene_id", "") or "").strip()
+            if cur_next != "":
+                continue
+
+            scene_id = str(row.get("scene_id", "") or "")
+            if scene_id == "" or scene_id not in uid_to_idx:
+                continue
+
+            prefix = self._trial_prefix_from_uid(scene_id)
+            if not prefix or prefix not in prefix_to_indices:
+                continue
+
+            scene_i = uid_to_idx[scene_id]
+            indices = prefix_to_indices[prefix]
+
+            candidates = []
+            for j in indices:
+                if j < scene_i:
+                    continue
+                uid2 = str(df_scenes.at[j, "uid"])
+                st2 = str(df_scenes.at[j, "scene_type"])
+                if st2 == "choice_text":
+                    continue
+                candidates.append(uid2)
+
+            if not candidates:
+                continue
+
+            candidates_pretty = [f"{u} | {self._text_preview(scene_text_map.get(u, ''), 90)}" for u in candidates]
+            target_text = str(row.get("target_text", "") or "")
+            scene_preview = self._text_preview(scene_text_map.get(scene_id, ""), 120)
+            context = (
+                f"[Spot] {len(tasks) + 1}\n"
+                f"spot_id: {str(row.get('spot_id', '') or '')}\n"
+                f"scene_id: {scene_id}\n"
+                f"scene: {scene_preview}\n"
+                f"target_text: {self._text_preview(target_text, 80)}\n\n"
+                "Tips:\n"
+                "- 候補をクリックするとメイン左リストもジャンプします\n"
+                "- メイン側で検索/フィルタして選択したUIDは「Set (Use Main Selection)」で設定できます"
+            )
+            tasks.append(
+                {
+                    "spot_id": str(row.get("spot_id", "") or ""),
+                    "candidates": candidates,
+                    "candidates_pretty": candidates_pretty,
+                    "context": context,
+                }
+            )
+
+        if not tasks:
+            QMessageBox.information(self, "Done", "No unresolved scenario_click_spot.next_scene_id found.")
+            return
+
+        self._next_scene_picker_dialog = NextScenePickerDialog(self, "spot", tasks)
+        self._next_scene_picker_dialog.show()
+        self._next_scene_picker_dialog.raise_()
+        self._next_scene_picker_dialog.activateWindow()
 
     # -------------------------------------------------------------------------
     # DB & Data Handling (New/Import/Open/Save)
